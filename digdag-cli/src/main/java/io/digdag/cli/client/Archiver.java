@@ -5,11 +5,8 @@ import com.google.inject.Inject;
 import io.digdag.cli.StdOut;
 import io.digdag.cli.YamlMapper;
 import io.digdag.client.config.Config;
-import io.digdag.core.archive.ArchiveMetadata;
 import io.digdag.core.archive.ProjectArchive;
 import io.digdag.core.archive.ProjectArchiveLoader;
-import io.digdag.core.archive.WorkflowResourceMatcher;
-import io.digdag.core.repository.WorkflowDefinition;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
 import org.apache.commons.compress.archivers.tar.TarConstants;
@@ -19,12 +16,15 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintStream;
-import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.nio.file.attribute.PosixFilePermission;
-import java.util.Date;
+import java.util.HashSet;
+import java.util.Set;
+
+import static com.google.common.base.Preconditions.checkArgument;
+import static java.util.Locale.ENGLISH;
 
 class Archiver
 {
@@ -40,23 +40,59 @@ class Archiver
         this.yamlMapper = yamlMapper;
     }
 
+    private static void listFilesRecursively(Path projectPath, Path targetDir, ProjectArchive.PathConsumer consumer, Set<String> listed)
+            throws IOException
+    {
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(targetDir, Archiver::rejectDotFiles)) {
+            for (Path path : ds) {
+                String resourceName = realPathToResourceName(projectPath, path);
+                if (listed.add(resourceName)) {
+                    consumer.accept(resourceName, path);
+                    if (Files.isDirectory(path)) {
+                        listFilesRecursively(projectPath, path, consumer, listed);
+                    }
+                }
+            }
+        }
+    }
+
+    private static String realPathToResourceName(Path projectPath, Path realPath)
+    {
+        checkArgument(projectPath.isAbsolute(), "project path must be absolute: %s", projectPath);
+        checkArgument(realPath.isAbsolute(), "real path must be absolute: %s", realPath);
+
+        if (!realPath.startsWith(projectPath)) {
+            throw new IllegalArgumentException(String.format(ENGLISH,
+                    "Given path '%s' is outside of project directory '%s'",
+                    realPath, projectPath));
+        }
+        Path relative = projectPath.relativize(realPath);
+
+        // resource name must be separated by '/'. Resource names are used as a part of
+        // workflow name later using following resourceNameToWorkflowName method.
+        // See also ProjectArchiveLoader.loadWorkflowFile.
+        return relative.toString().replace(File.separatorChar, '/');
+    }
+
+    private static boolean rejectDotFiles(Path target)
+    {
+        return !target.getFileName().toString().startsWith(".");
+    }
+
     void createArchive(Path projectPath, Path output, Config overwriteParams)
             throws IOException
     {
         out.println("Creating " + output + "...");
 
-        ProjectArchive project = projectLoader.load(projectPath, WorkflowResourceMatcher.defaultMatcher(), overwriteParams);
-        ArchiveMetadata meta = project.getArchiveMetadata();
-
         try (TarArchiveOutputStream tar = new TarArchiveOutputStream(new GzipCompressorOutputStream(Files.newOutputStream(output)))) {
             // default mode for file names longer than 100 bytes is throwing an exception (LONGFILE_ERROR)
             tar.setLongFileMode(TarArchiveOutputStream.LONGFILE_POSIX);
 
-            project.listFiles((resourceName, absPath) -> {
+            listFilesRecursively(projectPath, projectPath, (resourceName, absPath) -> {
                 if (!Files.isDirectory(absPath)) {
                     out.println("  Archiving " + resourceName);
 
-                    TarArchiveEntry e = buildTarArchiveEntry(project, absPath, resourceName);
+                    TarArchiveEntry e = buildTarArchiveEntry(projectPath, absPath, resourceName);
                     tar.putArchiveEntry(e);
                     if (e.isSymbolicLink()) {
                         out.println("    symlink -> " + e.getLinkName());
@@ -68,27 +104,11 @@ class Archiver
                         tar.closeArchiveEntry();
                     }
                 }
-            });
-
-            // create .digdag.dig
-            // TODO set default time zone if not set?
-            byte[] metaBody = yamlMapper.toYaml(meta).getBytes(StandardCharsets.UTF_8);
-            TarArchiveEntry metaEntry = new TarArchiveEntry(ArchiveMetadata.FILE_NAME);
-            metaEntry.setSize(metaBody.length);
-            metaEntry.setModTime(new Date());
-            tar.putArchiveEntry(metaEntry);
-            tar.write(metaBody);
-            tar.closeArchiveEntry();
+            }, new HashSet<>());
         }
-
-        out.println("Workflows:");
-        for (WorkflowDefinition workflow : meta.getWorkflowList().get()) {
-            out.println("  " + workflow.getName());
-        }
-        out.println("");
     }
 
-    private TarArchiveEntry buildTarArchiveEntry(ProjectArchive project, Path absPath, String name)
+    private TarArchiveEntry buildTarArchiveEntry(Path projectPath, Path absPath, String name)
             throws IOException
     {
         TarArchiveEntry e;
@@ -96,12 +116,12 @@ class Archiver
             e = new TarArchiveEntry(name, TarConstants.LF_SYMLINK);
             Path rawDest = Files.readSymbolicLink(absPath);
             Path normalizedAbsDest = absPath.getParent().resolve(rawDest).normalize();
-            try {
-                project.pathToResourceName(normalizedAbsDest);
+
+            if (!normalizedAbsDest.startsWith(projectPath)) {
+                throw new IllegalArgumentException(String.format(ENGLISH,
+                        "Invalid symbolic link: Given path '%s' is outside of project directory '%s'", normalizedAbsDest, projectPath));
             }
-            catch (IllegalArgumentException ex) {
-                throw new IllegalArgumentException("Invalid symbolic link: " + ex.getMessage());
-            }
+
             // absolute path will be invalid on a server. convert it to a relative path
             Path normalizedRelativeDest = absPath.getParent().relativize(normalizedAbsDest);
 
@@ -117,35 +137,35 @@ class Archiver
                 int mode = 0;
                 for (PosixFilePermission perm : Files.getPosixFilePermissions(absPath)) {
                     switch (perm) {
-                    case OWNER_READ:
-                        mode |= 0400;
-                        break;
-                    case OWNER_WRITE:
-                        mode |= 0200;
-                        break;
-                    case OWNER_EXECUTE:
-                        mode |= 0100;
-                        break;
-                    case GROUP_READ:
-                        mode |= 0040;
-                        break;
-                    case GROUP_WRITE:
-                        mode |= 0020;
-                        break;
-                    case GROUP_EXECUTE:
-                        mode |= 0010;
-                        break;
-                    case OTHERS_READ:
-                        mode |= 0004;
-                        break;
-                    case OTHERS_WRITE:
-                        mode |= 0002;
-                        break;
-                    case OTHERS_EXECUTE:
-                        mode |= 0001;
-                        break;
-                    default:
-                        // ignore
+                        case OWNER_READ:
+                            mode |= 0400;
+                            break;
+                        case OWNER_WRITE:
+                            mode |= 0200;
+                            break;
+                        case OWNER_EXECUTE:
+                            mode |= 0100;
+                            break;
+                        case GROUP_READ:
+                            mode |= 0040;
+                            break;
+                        case GROUP_WRITE:
+                            mode |= 0020;
+                            break;
+                        case GROUP_EXECUTE:
+                            mode |= 0010;
+                            break;
+                        case OTHERS_READ:
+                            mode |= 0004;
+                            break;
+                        case OTHERS_WRITE:
+                            mode |= 0002;
+                            break;
+                        case OTHERS_EXECUTE:
+                            mode |= 0001;
+                            break;
+                        default:
+                            // ignore
                     }
                 }
                 e.setMode(mode);
