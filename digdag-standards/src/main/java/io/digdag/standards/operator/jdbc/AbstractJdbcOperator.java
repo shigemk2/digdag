@@ -23,7 +23,6 @@ import java.util.List;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
-import static io.digdag.spi.TaskExecutionException.buildExceptionErrorConfig;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
@@ -195,7 +194,7 @@ public abstract class AbstractJdbcOperator <C>
         catch (DatabaseException ex) {
             // expected error that should suppress stacktrace by default
             String message = ex.getMessage();
-            throw new TaskExecutionException(message, buildExceptionErrorConfig(ex));
+            throw new TaskExecutionException(message, ex);
         }
     }
 
